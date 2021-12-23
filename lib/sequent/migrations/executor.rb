@@ -26,9 +26,9 @@ module Sequent
           table = migration.record_class
           current_table_name = table.table_name.gsub("_#{migration.version}", "")
           # 2 Rename old table
-          exec_sql("ALTER TABLE IF EXISTS #{current_table_name} RENAME TO #{current_table_name}_#{current_version}")
+          exec_sql("ALTER TABLE IF EXISTS view_schema.#{current_table_name} RENAME TO #{current_table_name}_#{current_version}")
           # 3 Rename new table
-          exec_sql("ALTER TABLE #{table.table_name} RENAME TO #{current_table_name}")
+          exec_sql("ALTER TABLE view_schema.#{table.table_name} RENAME TO #{current_table_name}")
           # Use new table from now on
           table.table_name = current_table_name
           table.reset_column_information
