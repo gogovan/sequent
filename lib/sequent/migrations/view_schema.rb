@@ -199,33 +199,29 @@ module Sequent
         ensure_version_correct!
 
         executor.set_table_names_to_new_version(plan)
-
         # 1 replay events not yet replayed
-        if plan.projectors.any?
-          time_current = Time.now
-          replay!(Sequent.configuration.offline_replay_persistor_class.new, exclude_ids: true, group_exponent: 1)
+        time_current = Time.now
+        replay!(Sequent.configuration.offline_replay_persistor_class.new, exclude_ids: true, group_exponent: 1) if plan.projectors.any?
+       
+        Sequent::ApplicationRecord.transaction do
+          # 1.1 Lock entire event record table
+          Sequent::ApplicationRecord.connection.execute("LOCK #{Sequent.configuration.event_record_class.table_name} IN ACCESS EXCLUSIVE MODE")
+          event_types = plan.projectors.flat_map { |projector| projector.message_mapping.keys }.uniq.map(&:name)
+          event_stream = Sequent.configuration.event_record_class.where(event_type: event_types)
+          event_stream = event_stream.where("NOT EXISTS (SELECT 1 FROM #{ReplayedIds.table_name} WHERE event_id = event_records.id)")
+          event_stream = event_stream.where("event_records.created_at > ?", time_current)
 
-          Sequent::ApplicationRecord.transaction do
-            # 1.1 Lock entire event record table
-            Sequent::ApplicationRecord.connection.execute("LOCK #{Sequent.configuration.event_record_class.table_name} IN ACCESS EXCLUSIVE MODE")
+          # 1.2 replay events that before lock event record table
+          no_parallel_replay!(Sequent.configuration.offline_replay_persistor_class.new, exclude_ids: true, group_exponent: 1) if !event_stream.count.zero?
 
-            event_types = plan.projectors.flat_map { |projector| projector.message_mapping.keys }.uniq.map(&:name)
-            event_stream = Sequent.configuration.event_record_class.where(event_type: event_types)
-            event_stream = event_stream.where("NOT EXISTS (SELECT 1 FROM #{ReplayedIds.table_name} WHERE event_id = event_records.id)")
-            event_stream = event_stream.where("event_records.created_at > ?", time_current)
-
-            # 1.2 replay events that before lock event record table
-            no_parallel_replay!(Sequent.configuration.offline_replay_persistor_class.new, exclude_ids: true, group_exponent: 1) if !event_stream.count.zero?
-
-            # 2.1, 2.2 switch table
-            executor.execute_offline(plan, current_version)
-            # 2.3 Create migration record
-            Versions.create!(version: Sequent.new_version)
-
-            # 3. Truncate replayed ids
-            truncate_replay_ids_table!
-          end
+          # 2.1, 2.2 switch table
+          executor.execute_offline(plan, current_version)
+          # 2.3 Create migration record
+          Versions.create!(version: Sequent.new_version)
         end
+
+        # 3. Truncate replayed ids
+        truncate_replay_ids_table!
 
         logger.info "Migrated to version #{Sequent.new_version}"
       rescue Exception => e
