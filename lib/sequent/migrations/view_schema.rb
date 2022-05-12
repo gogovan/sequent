@@ -201,19 +201,32 @@ module Sequent
         executor.set_table_names_to_new_version(plan)
 
         # 1 replay events not yet replayed
-        replay!(Sequent.configuration.offline_replay_persistor_class.new, exclude_ids: true, group_exponent: 1) if plan.projectors.any?
+        if plan.projectors.any?
+          time_current = Time.now
+          replay!(Sequent.configuration.offline_replay_persistor_class.new, exclude_ids: true, group_exponent: 1)
 
-        in_view_schema do
           Sequent::ApplicationRecord.transaction do
-            # 2.1, 2.2
+            # 1.1 Lock entire event record table
+            Sequent::ApplicationRecord.connection.execute("LOCK #{Sequent.configuration.event_record_class.table_name} IN ACCESS EXCLUSIVE MODE")
+
+            event_types = plan.projectors.flat_map { |projector| projector.message_mapping.keys }.uniq.map(&:name)
+            event_stream = Sequent.configuration.event_record_class.where(event_type: event_types)
+            event_stream = event_stream.where("NOT EXISTS (SELECT 1 FROM #{ReplayedIds.table_name} WHERE event_id = event_records.id)")
+            event_stream = event_stream.where("event_records.created_at > ?", time_current)
+
+            # 1.2 replay events that before lock event record table
+            no_parallel_replay!(Sequent.configuration.offline_replay_persistor_class.new, exclude_ids: true, group_exponent: 1) if !event_stream.count.zero?
+
+            # 2.1, 2.2 switch table
             executor.execute_offline(plan, current_version)
             # 2.3 Create migration record
             Versions.create!(version: Sequent.new_version)
-          end
 
-          # 3. Truncate replayed ids
-          truncate_replay_ids_table!
+            # 3. Truncate replayed ids
+            truncate_replay_ids_table!
+          end
         end
+
         logger.info "Migrated to version #{Sequent.new_version}"
       rescue Exception => e
         rollback_migration
@@ -222,13 +235,35 @@ module Sequent
 
       private
 
-
       def ensure_version_correct!
         create_view_schema_if_not_exists
         new_version = Sequent.new_version
 
         fail ArgumentError.new("new_version [#{new_version}] must be greater or equal to current_version [#{current_version}]") if new_version < current_version
 
+      end
+      
+      # original replay will run disconnect! and cause to transaction fail
+      def no_parallel_replay!(replay_persistor, projectors: plan.projectors, exclude_ids: false, group_exponent: 3)
+        logger.info "group_exponent: #{group_exponent.inspect}"
+
+        with_sequent_config(replay_persistor, projectors) do
+          logger.info "Start replaying events"
+
+          time("#{16 ** group_exponent} groups replayed") do
+            event_types = projectors.flat_map { |projector| projector.message_mapping.keys }.uniq.map(&:name)
+
+            number_of_groups = 16 ** group_exponent
+            groups = groups_of_aggregate_id_prefixes(number_of_groups)
+            result = groups.each_with_index.map do |aggregate_prefixes, index|
+              time("Group (#{aggregate_prefixes.first}-#{aggregate_prefixes.last}) #{index + 1}/#{number_of_groups} replayed") do
+                replay_events(aggregate_prefixes, event_types, exclude_ids, replay_persistor, &insert_ids)
+              end
+              nil
+            end
+            fail if result.nil?
+          end
+        end
       end
 
       def replay!(replay_persistor, projectors: plan.projectors, exclude_ids: false, group_exponent: 3)
